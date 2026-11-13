@@ -81,18 +81,28 @@ def _names() -> tuple[str, ...]:
     return tuple(f"git{ext}" for ext in exts) + ("git",)
 
 
+_WINDOWS_GIT_DIRS: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("ProgramFiles", ("Git", "cmd")),
+    ("ProgramFiles", ("Git", "bin")),
+    ("ProgramFiles", ("Git", "mingw64", "bin")),
+    ("ProgramFiles(x86)", ("Git", "cmd")),
+    ("LOCALAPPDATA", ("Programs", "Git", "cmd")),
+)
+
+
 def _known_dirs() -> tuple[str, ...]:
+    """Install locations, read from the environment rather than assumed.
+
+    ``ProgramFiles`` is set by Windows itself; inventing a drive letter when it is
+    absent would probe a directory this process was never told about. A missing
+    variable just drops its candidates — PATH is always probed as well.
+    """
     if os.name == "nt":
-        roots = [
-            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "cmd"),
-            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "bin"),
-            os.path.join(os.environ.get("ProgramFiles", r"C:\Program Files"), "Git", "mingw64", "bin"),
-            os.path.join(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)"), "Git", "cmd"),
-        ]
-        local = os.environ.get("LOCALAPPDATA")
-        if local:
-            roots.append(os.path.join(local, "Programs", "Git", "cmd"))
-        return tuple(roots)
+        return tuple(
+            os.path.join(base, *tail)
+            for var, tail in _WINDOWS_GIT_DIRS
+            if (base := os.environ.get(var))
+        )
     return ("/usr/bin", "/usr/local/bin", "/opt/homebrew/bin", "/opt/local/bin", "/bin")
 
 
