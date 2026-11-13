@@ -154,6 +154,140 @@ def _assert_not_delegated_child_mutation(path: str | Path | None = None) -> None
         raise PermissionError("delegate_task child contexts cannot mutate Kanban tasks or boards")
 
 
+# --- The decider rule: `done` is the decider's word (BOARD-SOP.md:17-25) ---
+#
+# `kanban_complete` is refused for every caller that is not the board's decider.
+# The tool hook (``agent-hooks/kanban-decider-guard.py``) is a UX fast-fail and
+# stays one: it sees tool calls only, so a shell (`hermes kanban complete`), a
+# dashboard close, a gateway/cron close or `import hermes_cli.kanban_db` walks
+# past it. The invariant lives here, beside the delegated-child fence, so every
+# caller inherits it and the two paths cannot disagree.
+#
+# The decider set has ONE definition: ``done-audit.py``'s ``--decider`` default,
+# read at call time exactly as the hook reads it (constant as fallback). A hook
+# and a kernel that each carried their own name would drift, and a drifted gate
+# is worse than no gate.
+
+DECIDER_FALLBACK = ("bram",)
+
+# The human at the `default` profile is not a bot and is not gated — the same
+# exemption the tool hook documents for itself ("A human at the `default`
+# profile is deliberately NOT wired to this hook — brian is not a bot"). Gating
+# him here would refuse the board's owner his own CLI close.
+HUMAN_PROFILES = ("default",)
+
+_DECIDER_RE = re.compile(
+    r"""["']--decider["']\s*,\s*default\s*=\s*"""
+    r"""(?:["']([^"']+)["']|([A-Za-z_][A-Za-z0-9_]*))"""
+)
+
+
+class DeciderRequiredError(PermissionError):
+    """``done`` refused: the caller is not this board's decider."""
+
+    def __init__(self, task_id: str, closer: str, decider: str, source: str) -> None:
+        self.task_id = task_id
+        self.closer = closer
+        self.decider = decider
+        super().__init__(
+            "kanban complete refused for %s: `done` is the decider's word on this "
+            "board and the decider is %s (BOARD-SOP.md:17-25; decider set read from "
+            "%s). This call comes from profile '%s'. Nothing changed — the card is "
+            "still where it was. Two legal exits, both visible to %s: "
+            "kanban_request_review(summary=..., metadata=...) to park the card for "
+            "the decider, or kanban_block(kind=\"needs_input\", reason=...) when a "
+            "decision is owed that you cannot produce yourself. Do not retry "
+            "complete: the same call gets the same answer."
+            % (task_id, decider, source, closer, decider)
+        )
+
+
+def _done_audit_path() -> Path:
+    """``done-audit.py`` — the one file that defines the decider set."""
+    override = os.environ.get("HERMES_DONE_AUDIT", "").strip()
+    if override:
+        return Path(override).expanduser()
+    from hermes_constants import get_default_hermes_root
+
+    return Path(get_default_hermes_root()) / "shared" / "brian-os" / "done-audit.py"
+
+
+def decider_set() -> tuple[tuple[str, ...], str]:
+    """The decider set and where it came from: ``done-audit.py``'s default.
+
+    Mirrors ``kanban-decider-guard.deciders()`` clause for clause, because both
+    read the same file and a reader must not have to guess which one it is
+    seeing. ``DECIDER_FALLBACK`` and ``"fallback (constant)"`` when that file is
+    unreadable — and the same words the hook prints when it falls back, so the
+    two refusal lines name the same source.
+    """
+    try:
+        text = _done_audit_path().read_text(encoding="utf-8")
+    except Exception:
+        return DECIDER_FALLBACK, "fallback (constant)"
+    hit = _DECIDER_RE.search(text)
+    if hit and hit.group(1):
+        return (hit.group(1),), "done-audit.py --decider default"
+    if hit and hit.group(2):
+        name = hit.group(2)
+        const = re.search(
+            r"(?m)^%s\s*=\s*[\"']([^\"']+)[\"']" % re.escape(name), text)
+        if const:
+            return (const.group(1),), "done-audit.py --decider default = %s" % name
+    return DECIDER_FALLBACK, "fallback (constant)"
+
+
+def _decider_audit_path() -> Path:
+    """The guard log the tool hook already writes: same file, one record of refusals."""
+    override = os.environ.get("HERMES_KANBAN_GUARD_LOG", "").strip()
+    if override:
+        return Path(override).expanduser()
+    from hermes_constants import get_default_hermes_root
+
+    return Path(get_default_hermes_root()) / "logs" / "kanban-decider-guard.jsonl"
+
+
+def _decider_audit(entry: dict) -> None:
+    """Append one refusal line; a log that cannot be written never blocks a refusal."""
+    try:
+        path = _decider_audit_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with open(path, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(entry, ensure_ascii=False) + "\n")
+    except Exception:
+        pass
+
+
+def _assert_decider_completion(task_id: str) -> str:
+    """Refuse ``done`` unless the caller is the decider; return the caller's name.
+
+    Called at the top of :func:`complete_task`, before the first read of durable
+    state, so every path — CLI, tool call, dashboard, gateway, cron, direct
+    import — fails closed here and nowhere else. The identity is the process's
+    own (:func:`_closer_identity`); nothing a caller passes in can clear this.
+    Raises :class:`DeciderRequiredError`; the refusal is logged to the same
+    ``logs/kanban-decider-guard.jsonl`` the tool hook writes, with the hook's
+    keys plus ``source`` naming this layer, so one file answers "who tried".
+    """
+    who = _closer_identity() or "unknown"
+    allowed, source = decider_set()
+    if who in allowed or who in HUMAN_PROFILES:
+        return who
+    decider = allowed[0]
+    _decider_audit({
+        "ts": time.strftime("%Y-%m-%dT%H:%M:%S"),
+        "decision": "block",
+        "tool": "kanban_complete",
+        "card": task_id,
+        "profile": who,
+        "decider": decider,
+        "decider_source": source,
+        "source": "kernel:complete_task",
+        "pid": os.getpid(),
+    })
+    raise DeciderRequiredError(task_id, who, decider, source)
+
+
 def _fire_kanban_lifecycle_hook(event: str, task_id: str, **fields: Any) -> None:
     """Best-effort lifecycle hook. Call AFTER the write txn commits (plugins never
     run under the SQLite write lock, always see durable state); failures are
@@ -2649,11 +2783,19 @@ def complete_task(
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
-    ``closer`` is the profile making the call; omitted it is resolved from the
-    process identity (:func:`_closer_identity`). It lands on the ``completed``
-    event as ``closer_profile`` beside ``run_profile`` — two facts, two fields.
-    The run's own ``profile`` column is left untouched: it still records who
-    executed the run.
+    The caller must be the board's decider: :func:`_assert_decider_completion`
+    runs first, at this layer, so the CLI, the tool call, the dashboard, the
+    gateway, cron and a direct import all inherit one check instead of each
+    carrying its own copy (PD-9). A non-decider raises
+    :class:`DeciderRequiredError` with nothing written. The human ``default``
+    profile and the decider set are the only callers that pass.
+
+    ``closer`` LABELS a close the caller was already allowed to make; it can
+    never clear the gate, which reads the process identity
+    (:func:`_closer_identity`) and nothing else. The name that is checked is
+    the name that is recorded: it lands on the ``completed`` event as
+    ``closer_profile`` beside ``run_profile`` — two facts, two fields. The run's
+    own ``profile`` column is left untouched: it still records who executed.
 
     ``ready`` is accepted for manual CLI completion, ``review`` for human
     approval. A ``running`` task under a live claim is only completed with
@@ -2670,6 +2812,8 @@ def complete_task(
     whitespace-only evidence raises :class:`EmptyCompletionError` after an
     auditable event. Approving a card out of ``review`` stays exempt.
     """
+    identity = _assert_decider_completion(task_id)
+    closer_profile = (closer or "").strip() or identity
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2742,7 +2886,7 @@ def complete_task(
             conn, task_id, "completed",
             _completed_event_payload(
                 result, event_summary, verified_cards, metadata,
-                closer_profile=(closer or "").strip() or _closer_identity(),
+                closer_profile=closer_profile,
                 run_profile=_run_profile(conn, run_id, task_id),
             ),
             run_id=run_id,
@@ -2890,10 +3034,12 @@ def _completed_event_payload(
     Two identity fields, deliberately: ``closer_profile`` is the caller of the
     completion and ``run_profile`` the owner of the closed run (the card's
     assignee). One field was the bug — the event carried only the run's, so a
-    decider closing a worker's card was recorded as the worker closing its own.
-    Events written before this field existed carry neither key: nothing was
-    backfilled, so an absent ``closer_profile`` means "predates the field",
-    not "no closer".
+    decider closing a worker's card was recorded as the worker closing its own
+    (t_fd9869ab: completed by bram, read back as wren). Events written before
+    this field existed carry neither key: nothing was backfilled, so an absent
+    ``closer_profile`` means "predates the field", not "no closer". No reader
+    may present the synthesized run row's ``profile`` as the actor — that row
+    names the assignee.
     """
     # Mirror CLI's _show_voice_status: include STT/TTS provider availability so the user can tell at a
     # glance *why* voice mode isn't working ("STT provider: MISSING ..." is the common case). ``record_key``
