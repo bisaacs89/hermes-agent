@@ -191,6 +191,11 @@ class _KanbanDispatcher:
             # file, or the dispatcher reads per-slug DBs nobody writes.
             from hermes_cli import kanban_db as _kb
             with _kb.pin_first_board_resolution():
+                _kbd().publish_board_dispatch_caps(
+                    slug,
+                    max_in_progress=self.settings.max_in_progress,
+                    max_in_progress_per_profile=self.settings.max_in_progress_per_profile,
+                )
                 conn = _kbc().connect(board=slug)
                 return _kbd().dispatch_once(conn, board=slug, **kwargs)
         except Exception as exc:

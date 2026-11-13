@@ -1978,6 +1978,84 @@ def configured_max_in_progress() -> Optional[int]:
     return ival if ival >= 1 else None
 
 
+BOARD_DISPATCH_CAPS_KEY = "dispatch_caps"
+
+
+def board_dispatch_caps(board: Optional[str] = None) -> Optional[dict]:
+    """The dispatch caps a dispatcher of record published for this board, or ``None``.
+
+    Stored in ``board.json`` (``dispatch_caps``) so the value travels with the
+    board, not with a process's config home and not with one process's boot
+    snapshot. ``None`` means "nobody has published one yet" — the caller's own
+    config then still applies, exactly as before this seam existed.
+    """
+    try:
+        meta = _kb.read_board_metadata(_kb._slug_or_default(board))
+    except Exception:
+        return None
+    caps = meta.get(BOARD_DISPATCH_CAPS_KEY)
+    return caps if isinstance(caps, dict) else None
+
+
+def publish_board_dispatch_caps(
+    board: Optional[str] = None,
+    *,
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+    published_by: str = "gateway",
+) -> bool:
+    """Record the caps the live dispatcher applies on the board. Returns True when written.
+
+    The embedded dispatcher calls this on every tick, so the board always names
+    the numbers actually being enforced. A write failure must not stop the
+    tick: the gateway still dispatches under its own caps, it just cannot
+    publish them (logged, not raised).
+    """
+    payload = {
+        "max_in_progress": max_in_progress,
+        "max_in_progress_per_profile": max_in_progress_per_profile,
+        "published_by": published_by,
+        "published_at": int(time.time()),
+    }
+    current = board_dispatch_caps(board) or {}
+    if all(current.get(key) == value for key, value in payload.items() if key != "published_at"):
+        return False
+    try:
+        _kb.write_board_metadata(board, dispatch_caps=payload)
+    except Exception:
+        _kb._log.warning(
+            "kanban dispatcher: could not record the board's dispatch caps on %r; "
+            "the tick still runs under the gateway's own values", board, exc_info=True,
+        )
+        return False
+    return True
+
+
+def resolve_dispatch_caps(
+    board: Optional[str] = None,
+    *,
+    max_in_progress: Optional[int],
+    max_in_progress_per_profile: Optional[int],
+) -> tuple[Optional[int], Optional[int], str]:
+    """``(max_in_progress, max_in_progress_per_profile, source)`` for this tick.
+
+    One authority: the board's recorded caps win over whatever home this process
+    read them from. That is what stops a home (``-p default`` reading 5/3) or a
+    gateway's boot snapshot from out-voting the dispatcher that is actually
+    running — the 17:00:08 split. ``source`` is ``"board"`` when the board
+    decided, else ``"config"`` (the caller's values stand because no dispatcher
+    of record has published any).
+    """
+    published = board_dispatch_caps(board)
+    if published is not None:
+        return (
+            published.get("max_in_progress"),
+            published.get("max_in_progress_per_profile"),
+            "board",
+        )
+    return max_in_progress, max_in_progress_per_profile, "config"
+
+
 def count_running_tasks(conn: sqlite3.Connection) -> int:
     """Number of tasks in ``status='running'``.
 
@@ -2447,6 +2525,14 @@ def _dispatch_once_locked(
     the PID so later ticks catch crashes before the TTL. Cap semantics:
     :func:`_tick_spawn_budget`."""
     result = DispatchResult()
+    # One cap authority: the board's recorded caps (published by the dispatcher
+    # of record on every tick) bind this tick too. A caller's own config home or
+    # a frozen boot snapshot decides only while nothing has been published.
+    max_in_progress, max_in_progress_per_profile, _caps_source = resolve_dispatch_caps(
+        board,
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
     _run_reclaim_phase(
         conn, result, stale_timeout_seconds=stale_timeout_seconds,
         failure_limit=failure_limit, reconcile_orphans=reconcile_orphans, board=board,

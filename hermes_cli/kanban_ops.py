@@ -81,6 +81,14 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     # Memory-derived default when unset — same fallback the gateway applies.
     configured_max_in_progress = kbd._positive_int(_kanban_cfg.get("max_in_progress"), None)
     max_in_progress = kbd.resolve_max_in_progress(configured_max_in_progress)
+    # One cap authority: when the board carries caps published by the dispatcher
+    # of record, those bind this pass too. A home's own numbers (5/3 on
+    # `-p default` at 17:00:08) must not out-vote the dispatcher that is live.
+    max_in_progress, max_in_progress_per_profile, caps_source = kbd.resolve_dispatch_caps(
+        getattr(args, "board", None),
+        max_in_progress=max_in_progress,
+        max_in_progress_per_profile=max_in_progress_per_profile,
+    )
     # CLI --max is the more explicit signal, so it wins over kanban.max_spawn.
     cli_max = getattr(args, "max", None)
     max_spawn = (
@@ -89,8 +97,9 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
     caps = {
         "max_in_progress": max_in_progress,
         "max_in_progress_source": (
-            "config" if configured_max_in_progress is not None
-            else f"derived floor {kbd.DERIVED_MAX_IN_PROGRESS_FLOOR}"
+            "board" if caps_source == "board"
+            else ("config" if configured_max_in_progress is not None
+                  else f"derived floor {kbd.DERIVED_MAX_IN_PROGRESS_FLOOR}")
         ),
         "max_in_progress_per_profile": max_in_progress_per_profile,
         "max_spawn": max_spawn,

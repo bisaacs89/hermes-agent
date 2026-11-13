@@ -70,10 +70,13 @@ def write_board_metadata(
     board: Optional[str], *, name: Optional[str] = None, description: Optional[str] = None,
     icon: Optional[str] = None, color: Optional[str] = None, archived: Optional[bool] = None,
     default_workdir: Optional[str] = None, project_id: Optional[str] = None,
+    dispatch_caps: Optional[dict] = None,
 ) -> dict:
     """Create/update ``board.json``; unmentioned fields are preserved, ``created_at``
     set on first write. ``project_id``/``default_workdir``: ``None`` = unchanged,
-    "" = clear (``project_id`` is not validated here)."""
+    ``""`` = clear (``project_id`` is not validated here). ``dispatch_caps``: ``None``
+    = unchanged; a dict replaces the board's recorded dispatch caps (the live
+    dispatcher's numbers — see ``kanban_db_dispatch.publish_board_dispatch_caps``)."""
     _kb._assert_not_delegated_child_mutation()
     slug = _kb._slug_or_default(board)
     meta = read_board_metadata(slug)
@@ -89,6 +92,13 @@ def write_board_metadata(
     for key, value in (("default_workdir", default_workdir), ("project_id", project_id)):
         if value is not None:
             meta[key] = str(value) if value else None
+    if dispatch_caps is not None:
+        meta["dispatch_caps"] = {
+            "max_in_progress": dispatch_caps.get("max_in_progress"),
+            "max_in_progress_per_profile": dispatch_caps.get("max_in_progress_per_profile"),
+            "published_by": dispatch_caps.get("published_by"),
+            "published_at": dispatch_caps.get("published_at"),
+        }
     if not meta.get("created_at"):
         meta["created_at"] = int(time.time())
     path = board_metadata_path(slug)
