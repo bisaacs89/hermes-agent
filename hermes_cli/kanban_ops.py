@@ -11,6 +11,7 @@ import os
 import sys
 import time
 from pathlib import Path
+from typing import Optional
 
 from hermes_cli import kanban_db as kb
 from hermes_cli import kanban_db_connect as kbc
@@ -57,7 +58,41 @@ def _cmd_tail(args: argparse.Namespace) -> int:
     return _poll_loop(args.interval, tick)
 
 
+def _second_dispatcher_refusal(args: argparse.Namespace) -> Optional[str]:
+    """The refusal text for a CLI dispatch beside a live embedded dispatcher, or ``None``.
+
+    ``_check_dispatcher_presence`` answers "is a gateway with
+    ``kanban.dispatch_in_gateway`` alive for this home". It fails OPEN with
+    ``(True, "")`` when it cannot probe, so only a *positively identified*
+    gateway — ``running`` with a message naming it — refuses here; an
+    unreadable probe stays silent rather than bricking every manual dispatch.
+
+    A second driver is not a budget question: at 17:00:08 the cron tick's CLI
+    dispatch and the gateway both claimed from the same board, and the workers
+    it spawned died with the CLI that owned them.
+    """
+    if getattr(args, "force", False):
+        return None
+    try:
+        from hermes_cli.kanban import _check_dispatcher_presence
+        running, message = _check_dispatcher_presence()
+    except Exception:
+        return None
+    if not (running and message):
+        return None
+    return (
+        f"kanban dispatch refused: {message} — the gateway's embedded dispatcher "
+        f"already ticks this home's board, and a second driver beside it races the "
+        f"same claims (the 17:00:08 breach: workers spawned by the CLI die with it). "
+        f"Nothing was dispatched. Let the gateway tick, or pass --force for a "
+        f"deliberate one-off."
+    )
+
+
 def _cmd_dispatch(args: argparse.Namespace) -> int:
+    refusal = _second_dispatcher_refusal(args)
+    if refusal:
+        return _err(refusal, 2)
     # Honour kanban.default_assignee, kanban.max_in_progress,
     # kanban.max_in_progress_per_profile and kanban.max_spawn with the same
     # semantics as the gateway dispatch path. The caps are read from THIS
