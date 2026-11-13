@@ -362,9 +362,12 @@ def _user_safe_directories(base_env: Mapping[str, str]) -> list[str]:
     env["GIT_TERMINAL_PROMPT"] = "0"
     values: list[str] = []
     for scope in ("--system", "--global"):
+        argv = _git_argv("config", scope, "-z", "--get-all", "safe.directory")
+        if argv is None:
+            break
         try:
             proc = subprocess.run(
-                ["git", "config", scope, "-z", "--get-all", "safe.directory"],
+                argv,
                 capture_output=True, text=True, encoding="utf-8", errors="replace",
                 timeout=5, stdin=subprocess.DEVNULL, env=env, check=False,
                 creationflags=windows_hide_flags(),
@@ -511,6 +514,19 @@ _MAX_FILTER_KEYS = 256
 FILTER_DISCOVERY_FAILED = "git filter discovery failed"
 
 
+def _git_argv(*args: str) -> list[str] | None:
+    """``git`` + ``args`` with a binary that has actually run, or ``None`` when none can.
+
+    A bare ``"git"`` trusts PATH order, which on a Windows host can hand back a
+    bundled ``git.EXE`` whose spawn raises ``WinError 5``. That is not an answer
+    ("no filters", "no safe dirs") — it is no answer at all.
+    """
+    from hermes_platform.resolver.git import resolve_git
+
+    git = resolve_git()
+    return [str(git.path), *args] if git.available else None
+
+
 def noninteractive_repo_git_env(
     cwd: str | os.PathLike[str],
     base: Mapping[str, str] | None = None,
@@ -529,11 +545,11 @@ def noninteractive_repo_git_env(
     # a bare spawn flashes a console. (Not bounded_git_probe: rc 1 = "no filters" is a verdict.)
     # One probe lists the filter keys and the include paths with their origin file: -z --show-origin
     # yields "file:<origin>", "<key>\n<value>" pairs.
-    proc = bounded_probe_run(
-        ["git", "-C", str(cwd), "config", "--includes", "--show-origin", "-z", "--get-regexp",
-         _DISCOVERY_KEYS_REGEXP],
-        timeout=2, env=env,
-    )
+    discovery = _git_argv("-C", str(cwd), "config", "--includes", "--show-origin", "-z",
+                          "--get-regexp", _DISCOVERY_KEYS_REGEXP)
+    if discovery is None:
+        return None
+    proc = bounded_probe_run(discovery, timeout=2, env=env)
     if proc is None or proc.returncode not in (0, 1):
         return None
     names: list[str] = []
@@ -554,8 +570,10 @@ def noninteractive_repo_git_env(
             if env.get("GIT_DIR") or env.get("GIT_WORK_TREE"):
                 return None
             if toplevel is None:
-                top = bounded_probe_run(["git", "-C", str(cwd), "rev-parse", "--show-toplevel"],
-                                        timeout=2, env=env)
+                rev_parse = _git_argv("-C", str(cwd), "rev-parse", "--show-toplevel")
+                if rev_parse is None:
+                    return None
+                top = bounded_probe_run(rev_parse, timeout=2, env=env)
                 if top is None or top.returncode != 0:
                     return None
                 toplevel = Path(top.stdout.rstrip("\r\n"))  # a checkout path may end in a space
@@ -567,10 +585,11 @@ def noninteractive_repo_git_env(
         if not target.is_file() or len(targets) >= _MAX_INCLUDE_TARGETS:
             return None  # a FIFO/device/directory, or too many targets to read on every call
         targets.add(target)
-        probe = bounded_probe_run(
-            ["git", "config", "--file", str(target), "--name-only", "-z", "--get-regexp", _DISCOVERY_KEYS_REGEXP],
-            timeout=2, env=env,
-        )
+        include_probe = _git_argv("config", "--file", str(target), "--name-only", "-z",
+                                  "--get-regexp", _DISCOVERY_KEYS_REGEXP)
+        if include_probe is None:
+            return None
+        probe = bounded_probe_run(include_probe, timeout=2, env=env)
         if probe is None or probe.returncode not in (0, 1):
             return None
         found = probe.stdout.split("\0")

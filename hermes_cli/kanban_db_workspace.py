@@ -59,18 +59,24 @@ def _git(repo_root: Path, *args: str, timeout: int) -> subprocess.CompletedProce
     unattended, which executes the repo's hooks, ``core.fsmonitor`` and smudge filters.
     """
     from hermes_cli._subprocess_compat import FILTER_DISCOVERY_FAILED, noninteractive_repo_git_env
+    git = _kb.resolve_git()
+    if not git.available:
+        raise _kb.GitUnread(git.unavailable_reason)
     env = noninteractive_repo_git_env(repo_root)
     if env is None:
-        return subprocess.CompletedProcess(["git", "-C", str(repo_root), *args], 1, "", FILTER_DISCOVERY_FAILED)
-    return subprocess.run(
-        ["git", "-C", str(repo_root), *args],
-        capture_output=True,
-        text=True, encoding='utf-8', errors='replace',
-        timeout=timeout,
-        check=False,
-        stdin=subprocess.DEVNULL,
-        env=env,
-    )
+        return subprocess.CompletedProcess([git.path, "-C", str(repo_root), *args], 1, "", FILTER_DISCOVERY_FAILED)
+    try:
+        return subprocess.run(
+            [git.path, "-C", str(repo_root), *args],
+            capture_output=True,
+            text=True, encoding='utf-8', errors='replace',
+            timeout=timeout,
+            check=False,
+            stdin=subprocess.DEVNULL,
+            env=env,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise _kb.GitUnread(_kb._exec_detail(exc)) from exc
 
 
 def _has_active_children(conn: sqlite3.Connection, task_id: str) -> bool:
@@ -623,8 +629,17 @@ def _maybe_emit_scratch_tip(
 # ---------------------------------------------------------------------------
 
 def _git_toplevel(path: Path) -> Optional[Path]:
-    """Return the git toplevel containing ``path``, or ``None`` if not in a repo."""
-    out = _kb._git_out(path, "rev-parse", "--show-toplevel")
+    """Return the git toplevel containing ``path``, or ``None`` if not in a repo.
+
+    ``None`` is git's own answer ("not a work tree"). When git cannot be run at
+    all, ``GitUnread`` propagates instead: an unspawnable binary says nothing
+    about ``path``, and a refusal that reads "not a git repo" would blame the
+    user's directory for the tool's absence.
+    """
+    try:
+        out = _kb._git_out(path, "rev-parse", "--show-toplevel")
+    except _kb.GitUnread as exc:
+        raise _kb.GitUnread(f"{exc.reason}; cannot tell whether {path} is a git repo") from exc
     if out is None:
         return None
     try:

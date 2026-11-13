@@ -30,6 +30,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional
 
 from hermes_cli.kanban_workflow import DEFAULT_STATUSES as VALID_STATUSES
+from hermes_platform.resolver.git import resolve_git
 from toolsets import get_toolset_names
 from utils import unlink_files_older_than
 
@@ -88,16 +89,47 @@ def _env_int(name: str, default: int, *, minimum: int = 0) -> int:
     return default
 
 
+class GitUnread(RuntimeError):
+    """git could not be run, so the question it was asked is unanswered.
+
+    Kept apart from "git ran and said no". A binary that exists and cannot be
+    spawned (``PermissionError [WinError 5]`` on a bundled ``git.EXE``) is not
+    evidence about the directory it was pointed at: reporting it as "not a git
+    repo" blames the user's path for a missing tool, and the dispatcher then
+    refuses a valid worktree root.
+    """
+
+    def __init__(self, reason: str) -> None:
+        self.reason = reason
+        super().__init__(f"unread — git unavailable: {reason}")
+
+
+def _exec_detail(exc: BaseException) -> str:
+    """An OS execution failure in the OS's own words (``WinError 5: Access is denied``)."""
+    winerror = getattr(exc, "winerror", None)
+    if winerror:
+        return f"WinError {winerror}: {getattr(exc, 'strerror', None) or exc}"
+    return f"{exc.__class__.__name__}: {exc}"
+
+
 def _git_out(cwd: Path, *args: str, timeout: int = 30) -> Optional[str]:
-    """Run ``git -C cwd args`` and return stripped stdout, or ``None`` on any failure / empty output."""
+    """Run ``git -C cwd args``; stripped stdout, or ``None`` when git answered "no".
+
+    Raises :class:`GitUnread` when git could not be executed at all — including the
+    case where the resolver's winner is denied at run time. Callers must not turn
+    that into a fact about ``cwd``.
+    """
+    git = resolve_git()
+    if not git.available:
+        raise GitUnread(git.unavailable_reason)
     try:
         result = subprocess.run(
-            ["git", "-C", str(cwd), *args],
+            [git.path, "-C", str(cwd), *args],
             capture_output=True, text=True, encoding="utf-8", errors="replace",
             timeout=timeout, check=False,
         )
-    except Exception:
-        return None
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise GitUnread(_exec_detail(exc)) from exc
     if result.returncode != 0:
         return None
     return (result.stdout or "").strip() or None
